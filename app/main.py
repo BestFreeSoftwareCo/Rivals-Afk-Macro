@@ -1,85 +1,89 @@
-import os
+from __future__ import annotations
+
+import logging
 import sys
 import tkinter as tk
+from tkinter import messagebox
+from pathlib import Path
 
-import ctypes
-
-from .autoit_bridge import AutoItBridge
-from .config_manager import ConfigManager
-from .error_handler import ErrorHandler
-from .hotkeys import HotkeyManager
-from .logger import setup_logger
-from .movement import MacroEngine
-from .picker import Picker
-from .ui_dark import AppUIDark
-
-
-def _enable_dpi_awareness() -> None:
-    if sys.platform != "win32":
-        return
-
-    try:
-        # Prefer Per-Monitor v2. If this succeeds, do not fall back to older APIs.
-        ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
-        return
-    except Exception:
-        pass
-
-    try:
-        # PROCESS_PER_MONITOR_DPI_AWARE = 2
-        ctypes.windll.shcore.SetProcessDpiAwareness(2)
-        return
-    except Exception:
-        pass
-
-    try:
-        ctypes.windll.user32.SetProcessDPIAware()
-    except Exception:
-        pass
+try:
+    from .autoit_bridge import AutoItBridge
+    from .config_manager import ConfigManager
+    from .error_handler import ErrorManager
+    from .hotkeys import HotkeyManager
+    from .logger import init_logging, parse_level, set_logging_level
+    from .ui import AppUI
+except ImportError:
+    root_dir = Path(__file__).resolve().parents[1]
+    if str(root_dir) not in sys.path:
+        sys.path.insert(0, str(root_dir))
+    from app.autoit_bridge import AutoItBridge
+    from app.config_manager import ConfigManager
+    from app.error_handler import ErrorManager
+    from app.hotkeys import HotkeyManager
+    from app.logger import init_logging, parse_level, set_logging_level
+    from app.ui import AppUI
 
 
 def main() -> None:
-    _enable_dpi_awareness()
-
-    base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
-    config_path = os.path.join(base_dir, "config", "config.ini")
-    log_path = os.path.join(base_dir, "logs", "debug.log")
-    runner_path = os.path.join(base_dir, "autoit", "runner.au3")
+    root_dir = Path(__file__).resolve().parents[1]
+    config_path = root_dir / "config" / "config.ini"
+    log_path = root_dir / "logs" / "debug.log"
+    runner_path = root_dir / "autoit" / "runner.au3"
 
     config = ConfigManager(config_path)
-    config.load()
 
-    logger = setup_logger(log_path, config.get("Debug", "Level", "INFO"))
-
-    root = tk.Tk()
+    logger = init_logging(log_path, config.get("Debug", "Level", fallback="INFO"))
+    set_logging_level(config.get("Debug", "Level", fallback="INFO"))
 
     try:
-        dpi = float(root.winfo_fpixels("1i"))
-        scaling = max(1.0, min(3.0, dpi / 72.0))
-        root.tk.call("tk", "scaling", scaling)
+        import customtkinter as ctk
+
+        root: tk.Tk = ctk.CTk()
+        try:
+            ctk.set_appearance_mode("dark")
+            ctk.set_default_color_theme("blue")
+        except Exception:
+            pass
     except Exception:
-        pass
+        root = tk.Tk()
+        try:
+            messagebox.showerror(
+                "Missing dependency",
+                "customtkinter is not installed.\n\nInstall it with:\n  pip install -r requirements.txt",
+            )
+        except Exception:
+            pass
+        return
 
-    error_handler = ErrorHandler(logger)
+    error_manager = ErrorManager(logger=logger)
+    autoit = AutoItBridge(runner_script_path=runner_path, logger=logger)
+    hotkeys = HotkeyManager(logger=logger)
 
-    autoit = AutoItBridge(runner_path, logger, error_handler)
-    picker = Picker(config, autoit, logger, error_handler)
-
-    macro = MacroEngine(config, autoit, logger, error_handler)
-
-    hotkeys = HotkeyManager(config, logger, error_handler, schedule_ui=lambda fn: root.after(0, fn))
-
-    ui = AppUIDark(
+    ui = AppUI(
         root=root,
         config=config,
-        logger=logger,
-        error_handler=error_handler,
-        macro_engine=macro,
-        picker=picker,
+        autoit=autoit,
         hotkeys=hotkeys,
+        error_manager=error_manager,
+        logger=logger,
     )
 
-    error_handler.set_on_error(ui.set_error)
+    def _on_uncaught(exc: BaseException) -> None:
+        error_manager.report("Unhandled exception", exc, critical=True)
+
+    def _report_callback_exception(
+        _self: tk.Tk,
+        exc: type[BaseException],
+        val: BaseException,
+        tb: object,
+    ) -> None:
+        _on_uncaught(val)
+
+    try:
+        root.report_callback_exception = _report_callback_exception  # type: ignore[assignment]
+    except Exception:
+        pass
 
     root.mainloop()
 

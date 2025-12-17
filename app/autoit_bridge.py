@@ -1,132 +1,185 @@
+from __future__ import annotations
+
+import logging
 import os
+import queue
+import shutil
 import subprocess
-from typing import Any, Sequence, Tuple
+import threading
+from pathlib import Path
+
+
+class AutoItBridgeError(RuntimeError):
+    pass
 
 
 class AutoItBridge:
-    def __init__(self, runner_au3_path: str, logger, error_handler=None):
-        self._runner_au3_path = runner_au3_path
-        self._logger = logger
-        self._error_handler = error_handler
-        self._init_error: BaseException | None = None
-        self._autoit_exe = self._find_autoit_exe()
+    def __init__(self, runner_script_path: Path, logger: logging.Logger | None = None):
+        self.runner_script_path = runner_script_path
+        self._logger = logger or logging.getLogger(__name__)
+        self._lock = threading.RLock()
+        self._proc: subprocess.Popen[str] | None = None
+        self._responses: queue.Queue[str] = queue.Queue()
+        self._stdout_thread: threading.Thread | None = None
+        self._stderr_thread: threading.Thread | None = None
 
-        if not os.path.isfile(self._runner_au3_path):
-            self._init_error = FileNotFoundError(f"AutoIt runner script not found: {self._runner_au3_path}")
+    def _find_autoit_exe(self) -> Path:
+        candidates: list[Path] = []
+
+        from_path = shutil.which("AutoIt3.exe")
+        if from_path:
+            candidates.append(Path(from_path))
+
+        candidates.extend(
+            [
+                Path(r"C:\Program Files (x86)\AutoIt3\AutoIt3.exe"),
+                Path(r"C:\Program Files\AutoIt3\AutoIt3.exe"),
+            ]
+        )
+
+        for p in candidates:
+            if p.exists():
+                return p
+
+        raise AutoItBridgeError("AutoIt3.exe not found. Install AutoIt v3 or add it to PATH.")
+
+    def _read_stdout(self) -> None:
+        proc = self._proc
+        if not proc or not proc.stdout:
+            return
+
+        while True:
+            line = proc.stdout.readline()
+            if line == "" and proc.poll() is not None:
+                break
+
+            line = line.strip()
+            if line:
+                self._responses.put(line)
+
+    def _read_stderr(self) -> None:
+        proc = self._proc
+        if not proc or not proc.stderr:
+            return
+
+        while True:
+            line = proc.stderr.readline()
+            if line == "" and proc.poll() is not None:
+                break
+
+            line = line.strip()
+            if line:
+                self._logger.warning("AutoIt STDERR: %s", line)
+
+    def _start_locked(self) -> None:
+        if self._proc and self._proc.poll() is None:
+            return
+
+        if not self.runner_script_path.exists():
+            raise AutoItBridgeError(f"Runner script missing: {self.runner_script_path}")
+
+        autoit_exe = self._find_autoit_exe()
+
+        creationflags = 0
+        if os.name == "nt":
+            creationflags = subprocess.CREATE_NO_WINDOW
+
+        self._responses = queue.Queue()
+        self._proc = subprocess.Popen(
+            [str(autoit_exe), str(self.runner_script_path)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+            creationflags=creationflags,
+        )
+
+        self._stdout_thread = threading.Thread(target=self._read_stdout, daemon=True)
+        self._stdout_thread.start()
+
+        self._stderr_thread = threading.Thread(target=self._read_stderr, daemon=True)
+        self._stderr_thread.start()
+
+        self.send("PING", timeout=2.0)
+
+    def start(self) -> None:
+        with self._lock:
+            self._start_locked()
+
+    def stop(self) -> None:
+        with self._lock:
+            proc = self._proc
+            self._proc = None
+
+        if proc and proc.poll() is None:
             try:
-                self._logger.error("%s", self._init_error)
+                if proc.stdin:
+                    proc.stdin.write("EXIT\n")
+                    proc.stdin.flush()
             except Exception:
                 pass
 
-    @property
-    def is_available(self) -> bool:
-        return self._init_error is None
+            try:
+                proc.terminate()
+            except Exception:
+                pass
 
-    def _find_autoit_exe(self) -> str:
-        env_path = os.environ.get("AUTOIT3_EXE", "").strip()
-        if env_path and os.path.isfile(env_path):
-            return env_path
+    def _restart_locked(self) -> None:
+        self.stop()
+        self._start_locked()
 
-        candidates = [
-            r"C:\Program Files (x86)\AutoIt3\AutoIt3.exe",
-            r"C:\Program Files\AutoIt3\AutoIt3.exe",
-            "AutoIt3.exe",
-        ]
-        for candidate in candidates:
-            if candidate == "AutoIt3.exe":
-                return candidate
-            if os.path.isfile(candidate):
-                return candidate
+    def send(self, command: str, *args: object, timeout: float = 2.0) -> str:
+        with self._lock:
+            last_error: Exception | None = None
 
-        return "AutoIt3.exe"
+            for attempt in range(2):
+                try:
+                    self._start_locked()
 
-    def _run(self, args: Sequence[Any], timeout_seconds: float = 5.0) -> subprocess.CompletedProcess:
-        if self._init_error is not None:
-            raise RuntimeError(str(self._init_error))
-        cmd = [self._autoit_exe, self._runner_au3_path, *[str(a) for a in args]]
-        self._logger.trace("AutoIt cmd=%s", cmd)
-        try:
-            return subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=timeout_seconds,
-                check=False,
-            )
-        except FileNotFoundError as exc:
-            raise FileNotFoundError(
-                "AutoIt3.exe was not found. Install AutoIt v3 or set AUTOIT3_EXE to the full path of AutoIt3.exe."
-            ) from exc
-        except subprocess.TimeoutExpired as exc:
-            raise RuntimeError(
-                f"AutoIt timed out after {timeout_seconds:.1f}s while running: {' '.join(str(x) for x in cmd)}"
-            ) from exc
+                    proc = self._proc
+                    if not proc or proc.poll() is not None or not proc.stdin:
+                        raise AutoItBridgeError("AutoIt process not running")
 
-    def _raise_for_result(self, action: str, result: subprocess.CompletedProcess) -> None:
-        if result.returncode == 0:
-            return
+                    line = "|".join([command] + [str(a) for a in args])
+                    self._logger.trace("AutoIt -> %s", line)
+                    proc.stdin.write(line + "\n")
+                    proc.stdin.flush()
 
-        out = (result.stdout or "").strip()
-        err = (result.stderr or "").strip()
-        details = (err or out or "").strip()
-        if not details:
-            details = f"AutoIt returned code {result.returncode}"
-        raise RuntimeError(f"AutoIt {action} failed: {details}")
+                    try:
+                        response = self._responses.get(timeout=timeout)
+                    except queue.Empty as e:
+                        raise AutoItBridgeError(f"AutoIt timeout waiting for response to {command}") from e
 
-    def move(self, x: int, y: int, speed: int) -> None:
-        result = self._run(["move", int(x), int(y), int(speed)])
-        self._raise_for_result("move", result)
+                    self._logger.trace("AutoIt <- %s", response)
+                    if response.startswith("ERR"):
+                        raise AutoItBridgeError(response)
 
-    def click(self, button: str, x: int, y: int, clicks: int = 1, speed: int = 0) -> None:
-        result = self._run(["click", button, int(x), int(y), int(clicks), int(speed)])
-        self._raise_for_result("click", result)
+                    return response
+                except Exception as e:
+                    last_error = e
+                    if attempt == 0:
+                        self._logger.warning("AutoIt bridge error, restarting: %s", e)
+                        try:
+                            self._restart_locked()
+                            continue
+                        except Exception:
+                            break
 
-    def get_mouse_pos(self) -> Tuple[int, int]:
-        result = self._run(["getpos"])
-        self._raise_for_result("getpos", result)
-        raw = (result.stdout or "").strip()
-        parts = raw.split(",")
-        if len(parts) != 2:
-            raise RuntimeError(f"Unexpected AutoIt getpos output: {raw}")
-        return int(parts[0]), int(parts[1])
+            raise AutoItBridgeError(str(last_error) if last_error else "AutoIt bridge error")
 
-    def send_key(self, key_name: str):
-        send_str = self._key_to_send_string(key_name)
-        result = self._run(["send", send_str])
-        self._raise_for_result("send", result)
+    def mouse_move(self, x: int, y: int, speed: int) -> None:
+        self.send("MOVE", int(x), int(y), int(speed))
 
-    def _key_to_send_string(self, key_name: str) -> str:
-        k = (key_name or "").strip().upper()
-        if not k:
-            return ""
+    def mouse_click(
+        self,
+        x: int,
+        y: int,
+        button: str = "left",
+        clicks: int = 1,
+        speed: int = 0,
+    ) -> None:
+        self.send("CLICK", int(x), int(y), button, int(clicks), int(speed))
 
-        if len(k) == 1 and (k.isalpha() or k.isdigit()):
-            return k
-
-        if k.startswith("F") and k[1:].isdigit():
-            return "{" + k + "}"
-
-        mapping = {
-            "SPACE": "{SPACE}",
-            "ENTER": "{ENTER}",
-            "RETURN": "{ENTER}",
-            "TAB": "{TAB}",
-            "ESC": "{ESC}",
-            "ESCAPE": "{ESC}",
-            "UP": "{UP}",
-            "DOWN": "{DOWN}",
-            "LEFT": "{LEFT}",
-            "RIGHT": "{RIGHT}",
-        }
-        if k in mapping:
-            return mapping[k]
-
-        if k in ("SHIFT", "CTRL", "CONTROL", "ALT"):
-            if k == "SHIFT":
-                return "{SHIFTDOWN}{SHIFTUP}"
-            if k in ("CTRL", "CONTROL"):
-                return "{CTRLDOWN}{CTRLUP}"
-            if k == "ALT":
-                return "{ALTDOWN}{ALTUP}"
-
-        return "{" + k + "}"
+    def send_key(self, send_text: str) -> None:
+        self.send("KEY", send_text)

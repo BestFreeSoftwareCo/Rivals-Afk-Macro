@@ -1,108 +1,50 @@
+from __future__ import annotations
+
+import ctypes
+import logging
+from ctypes import wintypes
 from collections.abc import Callable
-from typing import Any
 
 
-class Picker:
+class _POINT(ctypes.Structure):
+    _fields_ = [("x", wintypes.LONG), ("y", wintypes.LONG)]
+
+
+def get_cursor_pos() -> tuple[int, int]:
+    pt = _POINT()
+    ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+    return int(pt.x), int(pt.y)
+
+
+class LocationPicker:
     def __init__(
         self,
-        config: Any,
-        autoit: Any,
-        logger: Any,
-        error_handler: Any | None = None,
-        on_status: Callable[[str], None] | None = None,
-    ) -> None:
-        self._config = config
-        self._autoit = autoit
+        logger: logging.Logger,
+        on_confirm: Callable[[int, int], None],
+        on_cancel: Callable[[], None],
+    ):
         self._logger = logger
-        self._error_handler = error_handler
-        self._on_status = on_status
+        self._on_confirm = on_confirm
+        self._on_cancel = on_cancel
+        self.active = False
 
-        self._active = False
-        self._on_picked = None
-        self._on_cancelled = None
-        self._on_hide_ui = None
-        self._on_show_ui = None
-
-    @property
-    def is_active(self) -> bool:
-        return self._active
-
-    def begin(
-        self,
-        on_picked: Callable[[int, int], None],
-        on_cancelled: Callable[[], None],
-        on_hide_ui: Callable[[], None] | None = None,
-        on_show_ui: Callable[[], None] | None = None,
-    ) -> None:
-        if self._active:
-            return
-        self._active = True
-        self._on_picked = on_picked
-        self._on_cancelled = on_cancelled
-        self._on_hide_ui = on_hide_ui
-        self._on_show_ui = on_show_ui
-
-        try:
-            self._logger.info("PickMode ACTIVE")
-            if self._on_status:
-                self._on_status("Picking Location")
-            if self._on_hide_ui:
-                self._on_hide_ui()
-        except Exception as exc:
-            if self._error_handler:
-                self._error_handler.report("Picker.begin", exc)
-            else:
-                raise
-            self._end(restore_ui=True)
+    def enter(self) -> None:
+        self.active = True
+        self._logger.trace("PickMode ACTIVE")
 
     def confirm(self) -> None:
-        if not self._active:
+        if not self.active:
             return
-        try:
-            x, y = self._autoit.get_mouse_pos()
-            self._config.set("Click", "ClickX", x)
-            self._config.set("Click", "ClickY", y)
 
-            self._logger.info("Location confirmed at (%s, %s)", x, y)
-
-            if self._on_picked:
-                self._on_picked(x, y)
-        except Exception as exc:
-            if self._error_handler:
-                self._error_handler.report("Picker.confirm", exc)
-            else:
-                raise
-        finally:
-            self._end(restore_ui=True)
+        x, y = get_cursor_pos()
+        self.active = False
+        self._logger.info("Location confirmed at (%s, %s)", x, y)
+        self._on_confirm(x, y)
 
     def cancel(self) -> None:
-        if not self._active:
+        if not self.active:
             return
+
+        self.active = False
         self._logger.info("PickMode CANCELLED")
-        try:
-            if self._on_cancelled:
-                self._on_cancelled()
-        finally:
-            self._end(restore_ui=True)
-
-    def _end(self, restore_ui: bool) -> None:
-        self._active = False
-
-        on_show = self._on_show_ui
-        on_status = self._on_status
-        self._on_picked = None
-        self._on_cancelled = None
-        self._on_hide_ui = None
-        self._on_show_ui = None
-
-        if restore_ui and on_show:
-            try:
-                on_show()
-            except Exception:
-                pass
-
-        if on_status:
-            try:
-                on_status("Idle")
-            except Exception:
-                pass
+        self._on_cancel()

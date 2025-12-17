@@ -1,76 +1,76 @@
+from __future__ import annotations
+
 import logging
-import os
-from datetime import datetime
-from typing import Any
+from pathlib import Path
 
-TRACE_LEVEL_NUM = 5
-ACTION_LEVEL_NUM = 25
+ACTION_LEVEL = 25
+TRACE_LEVEL = 5
 
-logging.addLevelName(TRACE_LEVEL_NUM, "TRACE")
-logging.addLevelName(ACTION_LEVEL_NUM, "ACTION")
+logging.addLevelName(ACTION_LEVEL, "ACTION")
+logging.addLevelName(TRACE_LEVEL, "TRACE")
 
 
-def _trace(self: logging.Logger, message: str, *args: Any, **kwargs: Any) -> None:
-    if self.isEnabledFor(TRACE_LEVEL_NUM):
-        self._log(TRACE_LEVEL_NUM, message, args, **kwargs)
+def _action(self: logging.Logger, message: str, *args, **kwargs) -> None:
+    if self.isEnabledFor(ACTION_LEVEL):
+        self._log(ACTION_LEVEL, message, args, **kwargs)
 
 
-def _action(self: logging.Logger, message: str, *args: Any, **kwargs: Any) -> None:
-    if self.isEnabledFor(ACTION_LEVEL_NUM):
-        self._log(ACTION_LEVEL_NUM, message, args, **kwargs)
+def _trace(self: logging.Logger, message: str, *args, **kwargs) -> None:
+    if self.isEnabledFor(TRACE_LEVEL):
+        self._log(TRACE_LEVEL, message, args, **kwargs)
 
 
-logging.Logger.trace = _trace
-logging.Logger.action = _action
+if not hasattr(logging.Logger, "action"):
+    logging.Logger.action = _action  # type: ignore[attr-defined]
+if not hasattr(logging.Logger, "trace"):
+    logging.Logger.trace = _trace  # type: ignore[attr-defined]
 
 
-def _level_from_name(name: str) -> int:
-    value = (name or "INFO").strip().upper()
-    if value == "TRACE":
-        return TRACE_LEVEL_NUM
-    if value == "ACTION":
-        return ACTION_LEVEL_NUM
-    if value == "DEBUG":
-        return logging.DEBUG
-    if value == "INFO":
-        return logging.INFO
-    if value == "WARNING":
-        return logging.WARNING
-    if value == "ERROR":
-        return logging.ERROR
-    return logging.INFO
+_LEVEL_NAME_TO_VALUE: dict[str, int] = {
+    "TRACE": TRACE_LEVEL,
+    "DEBUG": logging.DEBUG,
+    "INFO": logging.INFO,
+    "ACTION": ACTION_LEVEL,
+    "WARNING": logging.WARNING,
+    "ERROR": logging.ERROR,
+    "CRITICAL": logging.CRITICAL,
+}
 
 
-def set_logger_level(logger: logging.Logger, level_name: str) -> None:
-    level_num = _level_from_name(level_name)
-    logger.setLevel(level_num)
-    for h in logger.handlers:
-        try:
-            h.setLevel(level_num)
-        except Exception:
-            pass
+def parse_level(level_name: str) -> int:
+    return _LEVEL_NAME_TO_VALUE.get(level_name.strip().upper(), logging.INFO)
 
 
-def setup_logger(log_file_path: str, level_name: str) -> logging.Logger:
-    dir_path = os.path.dirname(log_file_path)
-    if dir_path:
-        os.makedirs(dir_path, exist_ok=True)
+def init_logging(log_file_path: Path, level_name: str) -> logging.Logger:
+    log_file_path.parent.mkdir(parents=True, exist_ok=True)
 
-    logger = logging.getLogger("rivals_afk")
-    logger.propagate = False
+    logger = logging.getLogger()
+    logger.handlers.clear()
+    logger.setLevel(TRACE_LEVEL)
 
-    level_num = _level_from_name(level_name)
-    logger.setLevel(level_num)
+    formatter = logging.Formatter(
+        "[%(levelname)s] %(asctime)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
 
-    for h in list(logger.handlers):
-        logger.removeHandler(h)
+    level_value = parse_level(level_name)
 
-    handler = logging.FileHandler(log_file_path, encoding="utf-8")
-    handler.setLevel(level_num)
+    file_handler = logging.FileHandler(log_file_path, encoding="utf-8")
+    file_handler.setLevel(level_value)
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
 
-    formatter = logging.Formatter("[%(levelname)s] %(asctime)s %(message)s", "%Y-%m-%d %H:%M:%S")
-    handler.setFormatter(formatter)
-    logger.addHandler(handler)
+    stream_handler = logging.StreamHandler()
+    stream_handler.setLevel(level_value)
+    stream_handler.setFormatter(formatter)
+    logger.addHandler(stream_handler)
 
-    logger.info("---- Session start %s ----", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    logger.info("Log session start")
     return logger
+
+
+def set_logging_level(level_name: str) -> None:
+    level_value = parse_level(level_name)
+    root = logging.getLogger()
+    for handler in root.handlers:
+        handler.setLevel(level_value)

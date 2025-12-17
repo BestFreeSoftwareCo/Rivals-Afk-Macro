@@ -1,34 +1,54 @@
+from __future__ import annotations
+
+import logging
 import traceback
-
 from collections.abc import Callable
-from typing import Any
+from threading import RLock
 
 
-class ErrorHandler:
-    def __init__(self, logger: Any, on_error: Callable[[str], None] | None = None) -> None:
+class ErrorManager:
+    def __init__(
+        self,
+        logger: logging.Logger,
+        on_status: Callable[[str], None] | None = None,
+    ):
         self._logger = logger
-        self._on_error = on_error
+        self._on_status = on_status
+        self._lock = RLock()
+        self._last_error = ""
 
-    def set_on_error(self, on_error: Callable[[str], None] | None) -> None:
-        self._on_error = on_error
+    @property
+    def last_error(self) -> str:
+        with self._lock:
+            return self._last_error
 
-    def report(self, context: str, exc: BaseException) -> None:
-        try:
-            self._logger.error("%s: %s", context, exc)
+    def clear(self) -> None:
+        with self._lock:
+            self._last_error = ""
+
+        if self._on_status:
+            self._on_status("")
+
+    def report(self, message: str, exc: BaseException | None = None, critical: bool = False) -> None:
+        with self._lock:
+            details = message
+            if exc is not None:
+                details = f"{message}: {exc}"
+            self._last_error = details
+
+        if exc is not None:
             tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-            self._logger.error(tb)
-        except Exception:
-            pass
+            if critical:
+                self._logger.error(details)
+                self._logger.error(tb)
+            else:
+                self._logger.warning(details)
+                self._logger.warning(tb)
+        else:
+            if critical:
+                self._logger.error(details)
+            else:
+                self._logger.warning(details)
 
-        if self._on_error:
-            try:
-                self._on_error(f"{context}: {exc}")
-            except Exception:
-                pass
-
-    def safe_call(self, context: str, func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
-        try:
-            return func(*args, **kwargs)
-        except Exception as exc:
-            self.report(context, exc)
-            return None
+        if self._on_status:
+            self._on_status(details)

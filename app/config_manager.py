@@ -1,69 +1,100 @@
-import configparser
-import logging
-import os
-import threading
+from __future__ import annotations
 
-from typing import Any
+from configparser import ConfigParser
+import shutil
+from datetime import datetime
+from pathlib import Path
+from threading import RLock
 
 
 class ConfigManager:
-    def __init__(self, path: str):
-        self._path = path
-        self._lock = threading.Lock()
-        self._cfg = configparser.ConfigParser()
-        self._cfg.optionxform = str
-
-    @property
-    def path(self) -> str:
-        return self._path
+    def __init__(self, path: Path):
+        self.path = path
+        self._lock = RLock()
+        self._config = ConfigParser()
+        self.load()
 
     def load(self) -> None:
-        try:
-            with self._lock:
-                self._cfg.read(self._path, encoding="utf-8")
-        except Exception:
-            logging.getLogger(__name__).exception("Failed to load config: %s", self._path)
+        with self._lock:
+            self._config.read(self.path, encoding="utf-8")
 
     def save(self) -> None:
-        try:
-            dir_path = os.path.dirname(self._path)
-            if dir_path:
-                os.makedirs(dir_path, exist_ok=True)
-            with self._lock:
-                with open(self._path, "w", encoding="utf-8") as f:
-                    self._cfg.write(f)
-        except Exception:
-            logging.getLogger(__name__).exception("Failed to save config: %s", self._path)
+        with self._lock:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with self.path.open("w", encoding="utf-8") as f:
+                self._config.write(f)
+
+    def has_option(self, section: str, option: str) -> bool:
+        with self._lock:
+            return self._config.has_option(section, option)
 
     def ensure_section(self, section: str) -> None:
+        if not self._config.has_section(section):
+            self._config.add_section(section)
+
+    def get(self, section: str, option: str, fallback: str | None = None) -> str:
         with self._lock:
-            if not self._cfg.has_section(section):
-                self._cfg.add_section(section)
+            return self._config.get(section, option, fallback=fallback)
 
-    def get(self, section: str, option: str, fallback: str = "") -> str:
+    def getint(self, section: str, option: str, fallback: int = 0) -> int:
         with self._lock:
-            if not self._cfg.has_section(section):
-                return fallback
-            return self._cfg.get(section, option, fallback=fallback)
+            return self._config.getint(section, option, fallback=fallback)
 
-    def get_int(self, section: str, option: str, fallback: int = 0) -> int:
-        raw = self.get(section, option, str(fallback))
-        try:
-            return int(str(raw).strip())
-        except Exception:
-            return fallback
-
-    def get_float(self, section: str, option: str, fallback: float = 0.0) -> float:
-        raw = self.get(section, option, str(fallback))
-        try:
-            return float(str(raw).strip())
-        except Exception:
-            return fallback
-
-    def set(self, section: str, option: str, value: Any, autosave: bool = True) -> None:
+    def getfloat(self, section: str, option: str, fallback: float = 0.0) -> float:
         with self._lock:
-            if not self._cfg.has_section(section):
-                self._cfg.add_section(section)
-            self._cfg.set(section, option, str(value))
-        if autosave:
+            return self._config.getfloat(section, option, fallback=fallback)
+
+    def getboolean(self, section: str, option: str, fallback: bool = False) -> bool:
+        with self._lock:
+            return self._config.getboolean(section, option, fallback=fallback)
+
+    def set(self, section: str, option: str, value: object) -> None:
+        with self._lock:
+            self.ensure_section(section)
+            self._config.set(section, option, str(value))
+            self.save()
+
+    def reset_to_defaults(self) -> None:
+        with self._lock:
+            try:
+                if self.path.exists():
+                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    backup = self.path.with_suffix(self.path.suffix + f".bak.{ts}")
+                    shutil.copy2(self.path, backup)
+            except Exception:
+                pass
+
+            self._config = ConfigParser()
+
+            def _set(section: str, option: str, value: object) -> None:
+                if not self._config.has_section(section):
+                    self._config.add_section(section)
+                self._config.set(section, option, str(value))
+
+            _set("Location", "ClickX", 0)
+            _set("Location", "ClickY", 0)
+
+            _set("Hotkeys", "Start", "F6")
+            _set("Hotkeys", "Stop", "F7")
+            _set("Hotkeys", "ConfirmLocation", "F8")
+
+            _set("Movement", "Radius", 25)
+            _set("Movement", "SpinSpeed", 10)
+            _set("Movement", "MoveSpeed", 10)
+            _set("Movement", "StepDelayMs", 20)
+            _set("Movement", "Clockwise", 1)
+
+            _set("Clicking", "CenterClickEveryRotations", 1)
+            _set("Clicking", "BeforeClickDelayMs", 0)
+            _set("Clicking", "AfterClickDelayMs", 0)
+
+            _set("Loops", "LoopCount", 0)
+            _set("Loops", "PerLoopDelayMs", 0)
+            _set("Loops", "PostLoopKeyEnabled", 0)
+            _set("Loops", "PostLoopKey", "SPACE")
+
+            _set("UI", "LastTab", 0)
+            _set("UI", "Geometry", "900x692+477+142")
+
+            _set("Debug", "Level", "INFO")
             self.save()

@@ -1,18 +1,25 @@
-from typing import Any
+from __future__ import annotations
 
 
-class ActionRunner:
-    def __init__(self, config: Any, autoit: Any, logger: Any, error_handler: Any | None = None) -> None:
-        self._config = config
-        self._autoit = autoit
-        self._logger = logger
-        self._error_handler = error_handler
+def key_name_to_autoit_send(key_name: str) -> str:
+    name = key_name.strip().upper()
 
-    def run_post_loop_action(self) -> None:
-        enabled = self._config.get_int("Actions", "PostLoopEnabled", 0)
-        if not enabled:
-            return
+    if len(name) == 1 and name.isalpha():
+        return name.lower()
 
-        key = self._config.get("Actions", "PostLoopKey", "SPACE")
-        self._logger.action("Post-loop key press: %s", key)
-        self._autoit.send_key(key)
+    if len(name) == 1 and name.isdigit():
+        return name
+
+    if name.startswith("F") and name[1:].isdigit():
+        return "{" + name + "}"
+
+    if name in {"SPACE", "ENTER", "TAB", "ESC"}:
+        return "{" + name + "}"
+
+    if name == "SHIFT":
+        return "{SHIFTDOWN}{SHIFTUP}"
+
+    if name == "CTRL":
+        return "{CTRLDOWN}{CTRLUP}"
+
+    return name
