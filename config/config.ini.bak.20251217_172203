@@ -27,8 +27,11 @@ postloopkey = SPACE
 
 [UI]
 lasttab = 0
-geometry = 900x620+104+104
+geometry = 900x620+208+208
 
 [Debug]
 level = INFO
+
+[License]
+activated = 1
 
